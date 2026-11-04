@@ -33,10 +33,12 @@
             "format"
           ];
 
+          # XXX: There might be a better way to do this
           buildPhase = ''
-            make KDIR=${kernel.dev}/lib/modules/${kernel.modDirVersion}/build ${
-              lib.escapeShellArgs (kernel.extraMakeFlags or [ ])
-            }
+            make \
+              KDIR=${kernel.dev}/lib/modules/${kernel.modDirVersion}/build \
+              KCFLAGS="-Wno-unused-command-line-argument" \
+              ${lib.escapeShellArgs (kernel.extraMakeFlags or [ ])}
           '';
 
           installPhase = ''
