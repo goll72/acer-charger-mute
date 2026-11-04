@@ -13,8 +13,10 @@
 #include <linux/errno.h>
 #include <linux/init.h>
 #include <linux/jiffies.h>
+#include <linux/lockdep.h>
 #include <linux/module.h>
 #include <linux/mutex.h>
+#include <linux/notifier.h>
 #include <linux/workqueue.h>
 
 #include <sound/hda_codec.h>
@@ -78,6 +80,8 @@ static DEFINE_MUTEX(amp_mutex);
 
 static bool amp_muted;
 static u8 saved_amp[2];
+
+static struct work_struct codec_work;
 
 static struct delayed_work mute_work;
 static struct delayed_work restore_work;
@@ -214,10 +218,6 @@ static int write_amp_pair(struct hda_codec *codec,
 }
 
 
-/* --------------------------------------------------------------------------
- * Mute and restore operations
- * -------------------------------------------------------------------------- */
-
 /*
  * amp_mutex must be held by the caller.
  */
@@ -229,6 +229,11 @@ static int mute_speaker_locked(void)
     };
 
     int ret;
+
+    lockdep_assert_held(&amp_mutex);
+
+    if (!codec_dev || !codec)
+        return -ENODEV;
 
     if (amp_muted)
         return 0;
@@ -282,6 +287,11 @@ out_unlock:
 static int restore_speaker_locked(void)
 {
     int ret;
+
+    lockdep_assert_held(&amp_mutex);
+
+    if (!codec_dev || !codec)
+        return -ENODEV;
 
     if (!amp_muted)
         return 0;
@@ -412,40 +422,42 @@ static int match_codec(struct device *dev, const void *data)
 }
 
 
+/*
+ * amp_mutex must be held by the caller. The stored device reference keeps
+ * codec_dev alive; device_lock() serializes access against driver unbind.
+ */
 static int find_codec(void)
 {
     const unsigned int vendor_id = ACER_CODEC_VENDOR_ID;
+    struct device *dev;
     int ret;
 
-    codec_dev = bus_find_device(&snd_hda_bus_type,
-                                NULL,
-                                &vendor_id,
-                                match_codec);
+    lockdep_assert_held(&amp_mutex);
 
-    if (!codec_dev) {
-        pr_err("acer_charger_mute: codec 0x%08x not found\n",
-               ACER_CODEC_VENDOR_ID);
+    /* Multiple bind notifications may have queued this work. */
+    if (codec_dev && codec)
+        return 0;
+
+    dev = bus_find_device(&snd_hda_bus_type, NULL,
+                          &vendor_id, match_codec);
+    if (!dev) {
+        pr_debug("acer_charger_mute: codec 0x%08x not found yet\n",
+                 ACER_CODEC_VENDOR_ID);
         return -ENODEV;
     }
 
-    codec = dev_to_hda_codec(codec_dev);
-
-    device_lock(codec_dev);
-
-    if (!codec_dev->driver)
-        ret = -ENODEV;
-    else
-        ret = 0;
-
-    device_unlock(codec_dev);
+    device_lock(dev);
+    ret = dev->driver ? 0 : -ENODEV;
+    device_unlock(dev);
 
     if (ret < 0) {
-        dev_err(codec_dev, "HDA codec has no bound driver\n");
-        put_device(codec_dev);
-        codec_dev = NULL;
-        codec = NULL;
+        put_device(dev);
+        pr_debug("acer_charger_mute: codec found, but its driver is not bound yet\n");
         return ret;
     }
+
+    codec_dev = dev;
+    codec = dev_to_hda_codec(codec_dev);
 
     dev_info(codec_dev, "Found codec 0x%08x\n",
              codec->core.vendor_id);
@@ -453,12 +465,50 @@ static int find_codec(void)
     return 0;
 }
 
+static void codec_work_fn(struct work_struct *work)
+{
+    int ret;
+
+    mutex_lock(&amp_mutex);
+    ret = find_codec();
+    mutex_unlock(&amp_mutex);
+
+    if (ret < 0)
+        pr_debug("acer_charger_mute: codec discovery will be retried on the next HDA bind notification\n");
+}
+
+static int hda_bus_notify(struct notifier_block *nb,
+                          unsigned long action,
+                          void *data)
+{
+    struct device *dev = data;
+
+    if (action != BUS_NOTIFY_BOUND_DRIVER)
+        return NOTIFY_DONE;
+
+    if (dev->bus != &snd_hda_bus_type)
+        return NOTIFY_DONE;
+
+    /* Only schedule discovery for the codec supported by this module. */
+    if (dev_to_hdac_dev(dev)->vendor_id != ACER_CODEC_VENDOR_ID)
+        return NOTIFY_DONE;
+
+    schedule_work(&codec_work);
+
+    return NOTIFY_OK;
+}
+
+static struct notifier_block hda_bus_notifier = {
+    .notifier_call = hda_bus_notify,
+};
 
 static int __init acer_charger_mute_init(void)
 {
     acpi_handle ec_handle;
     acpi_status status;
     int ret;
+
+    INIT_WORK(&codec_work, codec_work_fn);
 
     INIT_DELAYED_WORK(&mute_work, mute_work_fn);
     INIT_DELAYED_WORK(&restore_work, restore_work_fn);
@@ -493,9 +543,12 @@ static int __init acer_charger_mute_init(void)
         return -ENODEV;
     }
 
-    ret = find_codec();
+    ret = bus_register_notifier(&snd_hda_bus_type,
+                                &hda_bus_notifier);
     if (ret < 0)
         return ret;
+
+    schedule_work(&codec_work);
 
     /*
      * Register our handler for EC query 0x38.
@@ -510,13 +563,20 @@ static int __init acer_charger_mute_init(void)
                                     NULL);
 
     if (ret < 0) {
-        dev_err(codec_dev,
-                "Failed to register EC query 0x%02x handler: %d\n",
-                ACER_EC_QUERY, ret);
+        pr_err("acer_charger_mute: failed to register EC query 0x%02x handler: %d\n",
+               ACER_EC_QUERY, ret);
 
-        put_device(codec_dev);
-        codec_dev = NULL;
-        codec = NULL;
+        /* Undo notifier/work registration before failing module init. */
+        bus_unregister_notifier(&snd_hda_bus_type, &hda_bus_notifier);
+        cancel_work_sync(&codec_work);
+
+        mutex_lock(&amp_mutex);
+        if (codec_dev) {
+            put_device(codec_dev);
+            codec_dev = NULL;
+            codec = NULL;
+        }
+        mutex_unlock(&amp_mutex);
 
         return ret;
     }
@@ -547,6 +607,9 @@ static void __exit acer_charger_mute_exit(void)
     cancel_delayed_work_sync(&mute_work);
     cancel_delayed_work_sync(&restore_work);
 
+    bus_unregister_notifier(&snd_hda_bus_type, &hda_bus_notifier);
+    cancel_work_sync(&codec_work);
+
     /*
      * Do not leave the speaker muted when unloading the module.
      */
@@ -557,13 +620,13 @@ static void __exit acer_charger_mute_exit(void)
         pr_err("acer_charger_mute: final speaker restoration failed: %d\n",
                ret);
 
-    mutex_unlock(&amp_mutex);
-
     if (codec_dev) {
         put_device(codec_dev);
         codec_dev = NULL;
         codec = NULL;
     }
+
+    mutex_unlock(&amp_mutex);
 
     pr_info("acer_charger_mute: unloaded\n");
 }
