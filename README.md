@@ -12,7 +12,8 @@ effects are preserved.
 > [!NOTE]
 >
 > This module was written for the Acer Aspire Go 15 (AG15-71P). If your model
-> differs, you will need to tweak the `ACER_*` constants at the top of
+> differs (assuming that the beep sound emitted can also be disabled by this
+> same mechanism), you will need to tweak the `ACER_*` constants at the top of
 > `acer_charger_mute.c` (codec vendor ID, speaker NID, EC query number).
 >
 > The default mute duration and delay values have been tested to work in the
