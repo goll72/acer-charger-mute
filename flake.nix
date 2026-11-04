@@ -18,11 +18,10 @@
 
       module =
         {
-          stdenv,
           buildPackages,
           kernel,
         }:
-        stdenv.mkDerivation {
+        kernel.stdenv.mkDerivation {
           pname = "acer-charger-mute";
           version = kernel.version;
 
@@ -35,7 +34,9 @@
           ];
 
           buildPhase = ''
-            make KDIR=${kernel.dev}/lib/modules/${kernel.modDirVersion}/build
+            make KDIR=${kernel.dev}/lib/modules/${kernel.modDirVersion}/build ${
+              lib.escapeShellArgs (kernel.extraMakeFlags or [ ])
+            }
           '';
 
           installPhase = ''
