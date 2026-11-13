@@ -54,7 +54,7 @@ extern void acpi_ec_remove_query_handler(struct acpi_ec *ec,
 #define RESTORE_RETRY_MS        1000
 
 
-static unsigned int mute_ms = 185;
+static unsigned int mute_ms = 400;
 module_param(mute_ms, uint, 0644);
 MODULE_PARM_DESC(mute_ms, "Speaker mute duration in milliseconds");
 
